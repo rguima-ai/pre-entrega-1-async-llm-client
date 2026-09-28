@@ -1,0 +1,9 @@
+# Versiones mínimas con las que se probó el proyecto (Python 3.12)
+openai>=3.20
+anthropic>=1.9
+pydantic>=2.13
+python-dotenv>=1.2
+
+# tests
+pytest>=9.1
+pytest-asyncio>=1.4
