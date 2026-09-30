@@ -17,7 +17,7 @@ from manager import AsyncLLMManager
 from schemas import ChatMessage, LLMConfig, ModelResponse, Provider, Role
 
 PREGUNTA = [ChatMessage(role=Role.USER, content="¿Qué es la entropía?")]
-ENV_VARS = ["LLM_PROVIDER", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_MODEL", "ANTHROPIC_MODEL",
+ENV_VARS = ["LLM_PROVIDER", "LLM_FALLBACK_PROVIDER", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_MODEL", "ANTHROPIC_MODEL",
             "LLM_TEMPERATURE", "LLM_MAX_TOKENS", "LLM_TIMEOUT_S", "LLM_MAX_RETRIES"]
 
 
@@ -147,6 +147,17 @@ def make_config(provider: Provider = Provider.OPENAI, **overrides) -> LLMConfig:
 
 def make_client(client_cls, fake, **overrides):
     return client_cls(make_config(client_cls.provider, **overrides), sdk_client=fake)
+
+
+def make_manager(primary_fake: FakeOpenAI, fallback_fake: FakeAnthropic | None = None,
+                 **overrides) -> AsyncLLMManager:
+    """Manager con OpenAI de principal y (opcional) Anthropic de respaldo, ambos con SDK falso."""
+    fallback_config = make_config(Provider.ANTHROPIC, **overrides) if fallback_fake else None
+    manager = AsyncLLMManager(make_config(Provider.OPENAI, **overrides), fallback_config)
+    manager.client = OpenAIClient(manager.config, sdk_client=primary_fake)
+    if fallback_fake:
+        manager.fallback_client = AnthropicClient(fallback_config, sdk_client=fallback_fake)
+    return manager
 
 
 async def collect(stream) -> list[str]:
@@ -395,3 +406,92 @@ async def test_stream_con_rate_limit_persistente_devuelve_error_controlado():
     tokens = await collect(make_client(AnthropicClient, fake, max_retries=2).generate_stream(PREGUNTA))
     assert tokens == [f"{STREAM_ERROR_PREFIX}RateLimitError: Rate limit"]
     assert len(fake.calls) == 3
+
+
+# ---------- 6. Fallback entre proveedores ----------
+async def test_fallback_responde_cuando_el_principal_agota_los_reintentos_por_rate_limit():
+    principal = FakeOpenAI(*[rate_limit(openai) for _ in range(3)])
+    respaldo = FakeAnthropic("respuesta de anthropic")
+    r = await make_manager(principal, respaldo, max_retries=2).generate(PREGUNTA)
+    assert r.ok
+    assert r.provider == Provider.ANTHROPIC
+    assert r.content == "respuesta de anthropic"
+    assert len(principal.calls) == 3  # primero agotó sus reintentos
+    assert len(respaldo.calls) == 1
+
+
+async def test_fallback_ante_error_permanente_sin_reintentar_el_principal():
+    principal = FakeOpenAI(auth_error(openai))
+    respaldo = FakeAnthropic("respuesta de anthropic")
+    r = await make_manager(principal, respaldo).generate(PREGUNTA)
+    assert r.provider == Provider.ANTHROPIC
+    assert len(principal.calls) == 1
+
+
+async def test_si_el_principal_responde_no_se_llama_al_fallback():
+    respaldo = FakeAnthropic("no debería llegar acá")
+    r = await make_manager(FakeOpenAI("respuesta de openai"), respaldo).generate(PREGUNTA)
+    assert r.provider == Provider.OPENAI
+    assert respaldo.calls == []
+
+
+async def test_sin_fallback_configurado_devuelve_el_error_del_principal():
+    r = await make_manager(FakeOpenAI(auth_error(openai))).generate(PREGUNTA)
+    assert not r.ok
+    assert r.provider == Provider.OPENAI
+
+
+async def test_si_fallan_los_dos_el_error_informa_ambos():
+    principal = FakeOpenAI(auth_error(openai))
+    respaldo = FakeAnthropic(*[rate_limit(anthropic) for _ in range(3)])
+    r = await make_manager(principal, respaldo, max_retries=2).generate(PREGUNTA)
+    assert not r.ok
+    assert r.error.startswith("openai: AuthenticationError")
+    assert "anthropic: RateLimitError" in r.error
+
+
+async def test_stream_hace_fallback_si_el_principal_falla_antes_del_primer_token():
+    principal = FakeOpenAI(auth_error(openai))
+    respaldo = FakeAnthropic(["hola ", "desde anthropic"])
+    tokens = await collect(make_manager(principal, respaldo).generate_stream(PREGUNTA))
+    assert tokens == ["hola ", "desde anthropic"]
+
+
+async def test_stream_no_hace_fallback_si_el_principal_ya_emitio_tokens():
+    principal = FakeOpenAI(["hola ", network_error(openai)])
+    respaldo = FakeAnthropic(["no debería ", "aparecer"])
+    tokens = await collect(make_manager(principal, respaldo).generate_stream(PREGUNTA))
+    assert tokens[0] == "hola "
+    assert tokens[-1].startswith(STREAM_ERROR_PREFIX)
+    assert respaldo.calls == []
+
+
+def test_factory_arma_el_fallback_desde_el_env(clean_env):
+    clean_env.setenv("LLM_PROVIDER", "openai")
+    clean_env.setenv("LLM_FALLBACK_PROVIDER", "anthropic")
+    clean_env.setenv("OPENAI_API_KEY", "sk-test")
+    clean_env.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    manager = AsyncLLMManager.from_env()
+    assert isinstance(manager.client, OpenAIClient)
+    assert isinstance(manager.fallback_client, AnthropicClient)
+    assert AsyncLLMManager.from_env(with_fallback=False).fallback_client is None
+
+
+def test_factory_sin_llm_fallback_provider_no_arma_respaldo(clean_env):
+    clean_env.setenv("OPENAI_API_KEY", "sk-test")
+    assert AsyncLLMManager.from_env().fallback_client is None
+
+
+def test_factory_avisa_si_falta_la_key_del_fallback(clean_env):
+    clean_env.setenv("LLM_FALLBACK_PROVIDER", "anthropic")
+    clean_env.setenv("OPENAI_API_KEY", "sk-test")
+    with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
+        AsyncLLMManager.from_env()
+
+
+def test_factory_rechaza_fallback_igual_al_principal(clean_env):
+    clean_env.setenv("LLM_PROVIDER", "openai")
+    clean_env.setenv("LLM_FALLBACK_PROVIDER", "openai")
+    clean_env.setenv("OPENAI_API_KEY", "sk-test")
+    with pytest.raises(ValueError, match="distinto"):
+        AsyncLLMManager.from_env()

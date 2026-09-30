@@ -17,7 +17,8 @@ PREGUNTA = [
 def crear_managers() -> list[AsyncLLMManager]:
     """Ambos proveedores si están las dos keys; si no, el que indique LLM_PROVIDER."""
     if all(os.getenv(var) for var in API_KEY_ENV.values()):
-        return [AsyncLLMManager.from_env(p) for p in Provider]
+        # Sin fallback: acá queremos ver responder a cada proveedor por sí mismo.
+        return [AsyncLLMManager.from_env(p, with_fallback=False) for p in Provider]
     return [AsyncLLMManager.from_env()]
 
 
@@ -46,6 +47,18 @@ async def prueba_key_invalida() -> None:
     print(f"Error controlado ({r.attempts} intento/s): {r.error}")
 
 
+async def prueba_fallback() -> None:
+    """Principal con key inválida a propósito: tiene que responder Anthropic sin intervención."""
+    if not os.getenv(API_KEY_ENV[Provider.ANTHROPIC]):
+        print("(se saltea: hace falta ANTHROPIC_API_KEY para que el respaldo pueda responder)")
+        return
+    principal = LLMConfig(provider=Provider.OPENAI, api_key="sk-invalida-a-proposito")
+    manager = AsyncLLMManager(principal, fallback_config=LLMConfig.from_env(Provider.ANTHROPIC))
+    r = await manager.generate(PREGUNTA)
+    print(f"Respondió: {r.provider.value}")
+    print(r.content if r.ok else f"❌ {r.error}")
+
+
 async def main() -> None:
     load_dotenv()
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
@@ -66,6 +79,9 @@ async def main() -> None:
 
     print("\n=== Prueba de resiliencia: API key inválida ===")
     await prueba_key_invalida()
+
+    print("\n=== Prueba de fallback: OpenAI con key inválida -> responde Anthropic ===")
+    await prueba_fallback()
 
 
 if __name__ == "__main__":
