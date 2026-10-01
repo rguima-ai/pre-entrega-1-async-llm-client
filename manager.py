@@ -71,9 +71,9 @@ class AsyncLLMManager:
         if backup.ok:
             return backup
         # Fallaron los dos: devolvemos ambos errores para saber qué pasó con cada uno.
-        both = (f"{self.config.provider.value}: {response.error} | "
-                f"{self.fallback_config.provider.value}: {backup.error}")
-        return backup.model_copy(update={"error": both})
+        errors = {self.config.provider: response.error, self.fallback_config.provider: backup.error}
+        both = " | ".join(f"{provider.value}: {error}" for provider, error in errors.items())
+        return backup.model_copy(update={"error": both, "provider_errors": errors})
 
     async def generate_stream(self, messages: list[ChatMessage]) -> AsyncIterator[str]:
         # Fallback solo si el principal falla ANTES del primer token: si el usuario ya vio

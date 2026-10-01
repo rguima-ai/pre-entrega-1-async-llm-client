@@ -13,6 +13,7 @@ import pytest
 from pydantic import ValidationError
 
 from clients import STREAM_ERROR_PREFIX, AnthropicClient, OpenAIClient
+from main import describir_resultado
 from manager import AsyncLLMManager
 from schemas import ChatMessage, LLMConfig, ModelResponse, Provider, Role
 
@@ -448,6 +449,7 @@ async def test_si_fallan_los_dos_el_error_informa_ambos():
     assert not r.ok
     assert r.error.startswith("openai: AuthenticationError")
     assert "anthropic: RateLimitError" in r.error
+    assert list(r.provider_errors) == [Provider.OPENAI, Provider.ANTHROPIC]
 
 
 async def test_stream_hace_fallback_si_el_principal_falla_antes_del_primer_token():
@@ -495,3 +497,29 @@ def test_factory_rechaza_fallback_igual_al_principal(clean_env):
     clean_env.setenv("OPENAI_API_KEY", "sk-test")
     with pytest.raises(ValueError, match="distinto"):
         AsyncLLMManager.from_env()
+
+
+# ---------- 7. Lo que muestra la demo de fallback ----------
+async def test_demo_fallback_dice_que_ningun_proveedor_respondio_si_fallan_los_dos():
+    # El caso real del bug: OpenAI con key inválida y Anthropic sin crédito (400 permanente).
+    sin_credito = _status_error(anthropic.BadRequestError, anthropic, 400,
+                                "Your credit balance is too low")
+    manager = make_manager(FakeOpenAI(auth_error(openai)), FakeAnthropic(sin_credito))
+    texto = describir_resultado(await manager.generate(PREGUNTA))
+    assert texto.startswith("❌ Ningún proveedor respondió")
+    assert "Respondió:" not in texto
+    assert "  - openai: AuthenticationError" in texto
+    assert "  - anthropic: BadRequestError" in texto
+    assert "credit balance is too low" in texto
+
+
+async def test_demo_fallback_muestra_quien_respondio():
+    manager = make_manager(FakeOpenAI(auth_error(openai)), FakeAnthropic("respuesta de anthropic"))
+    texto = describir_resultado(await manager.generate(PREGUNTA))
+    assert texto == "Respondió: anthropic\nrespuesta de anthropic"
+
+
+async def test_demo_sin_fallback_muestra_el_error_del_unico_proveedor():
+    texto = describir_resultado(await make_manager(FakeOpenAI(auth_error(openai))).generate(PREGUNTA))
+    assert texto.startswith("❌ Ningún proveedor respondió")
+    assert "  - openai: AuthenticationError" in texto

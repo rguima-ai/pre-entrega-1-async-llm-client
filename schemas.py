@@ -82,6 +82,9 @@ class ModelResponse(BaseModel):
     model: str
     content: str = ""
     error: str | None = None
+    # Solo cuando fallaron principal y fallback: el error de cada uno, en el orden en que se probaron.
+    # En ese caso `provider` es el último que se intentó, no uno que haya respondido.
+    provider_errors: dict[Provider, str] = Field(default_factory=dict)
     attempts: int = Field(default=1, ge=1)
     latency_ms: float = Field(default=0.0, ge=0)
 

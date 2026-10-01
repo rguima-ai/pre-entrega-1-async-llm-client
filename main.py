@@ -6,7 +6,7 @@ import os
 from dotenv import load_dotenv
 
 from manager import AsyncLLMManager
-from schemas import API_KEY_ENV, ChatMessage, LLMConfig, Provider, Role
+from schemas import API_KEY_ENV, ChatMessage, LLMConfig, ModelResponse, Provider, Role
 
 PREGUNTA = [
     ChatMessage(role=Role.SYSTEM, content="Respondé en español, en dos oraciones como máximo."),
@@ -54,9 +54,16 @@ async def prueba_fallback() -> None:
         return
     principal = LLMConfig(provider=Provider.OPENAI, api_key="sk-invalida-a-proposito")
     manager = AsyncLLMManager(principal, fallback_config=LLMConfig.from_env(Provider.ANTHROPIC))
-    r = await manager.generate(PREGUNTA)
-    print(f"Respondió: {r.provider.value}")
-    print(r.content if r.ok else f"❌ {r.error}")
+    print(describir_resultado(await manager.generate(PREGUNTA)))
+
+
+def describir_resultado(r: ModelResponse) -> str:
+    """Quién respondió o, si no respondió nadie, el error de cada proveedor que se intentó."""
+    if r.ok:
+        return f"Respondió: {r.provider.value}\n{r.content}"
+    errores = r.provider_errors or {r.provider: r.error}
+    detalle = "\n".join(f"  - {provider.value}: {error}" for provider, error in errores.items())
+    return f"❌ Ningún proveedor respondió:\n{detalle}"
 
 
 async def main() -> None:
